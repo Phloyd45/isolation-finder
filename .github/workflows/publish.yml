@@ -1,0 +1,141 @@
+name: Build map data and publish site
+
+# Builds ready-made map tiles for Great Britain from the Geofabrik extract of OpenStreetMap,
+# keeps them on the map-data branch, and publishes index.html plus the tiles to GitHub Pages.
+# The tiles are rebuilt monthly, on a manual run, or on a push when no tiles exist yet.
+# A push that only changes the page reuses the stored tiles, so it publishes in about a minute.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 2 3 * *'   # 02:23 UTC on the 3rd of each month
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Rebuild the map data from the latest Great Britain extract
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      rebuild: ${{ steps.p.outputs.rebuild }}
+    steps:
+      - id: p
+        env:
+          EVENT: ${{ github.event_name }}
+          WANT: ${{ inputs.rebuild }}
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT" = "schedule" ] || { [ "$EVENT" = "workflow_dispatch" ] && [ "$WANT" = "true" ]; }; then
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --heads "https://x-access-token:${TOKEN}@github.com/${REPO}.git" map-data > /dev/null; then
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  data:
+    needs: plan
+    if: needs.plan.outputs.rebuild == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          { sudo apt-get update -q
+            sudo apt-get install -y -q osmium-tool
+            pip install --quiet "osmium>=4,<5" "shapely>=2,<3" "numpy>=1.26"
+            osmium --version | head -1; } 2>&1 | tee -a build.log
+
+      - name: Download the Great Britain extract
+        run: |
+          { curl -fsSL --retry 3 -o gb.osm.pbf https://download.geofabrik.de/europe/great-britain-latest.osm.pbf
+            curl -fsSL --retry 3 -o gb.poly https://download.geofabrik.de/europe/great-britain.poly
+            ls -lh gb.osm.pbf gb.poly; } 2>&1 | tee -a build.log
+
+      - name: Keep buildings, residential areas and settlements
+        run: |
+          { osmium tags-filter gb.osm.pbf \
+              nwr/building=house,residential,detached,semidetached_house,terrace,bungalow,apartments,farm,cabin,static_caravan,dormitory,yes \
+              nwr/landuse=residential \
+              n/place=city,town,village,hamlet,isolated_dwelling \
+              -o filtered.osm.pbf --overwrite
+            rm gb.osm.pbf
+            ls -lh filtered.osm.pbf; } 2>&1 | tee -a build.log
+
+      - name: Build tiles
+        run: python3 tools/build_tiles.py filtered.osm.pbf gb.poly out/data 2>&1 | tee -a build.log
+
+      - name: Store the tiles on the map-data branch
+        run: |
+          cd out
+          git init -q -b map-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git commit -q -m "Map data built $(date -u +%F)"
+          git push -q --force "https://x-access-token:${TOKEN}@github.com/${REPO}.git" map-data
+
+      - name: Save the log to the build-log branch if anything failed
+        if: failure()
+        run: |
+          mkdir -p logbranch && cd logbranch
+          { cat ../build.log 2>/dev/null || echo "No log was written."; } | tail -n 300 > build.log
+          git init -q -b build-log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build.log
+          git commit -q -m "Failed build $(date -u +%FT%TZ)"
+          git push -q --force "https://x-access-token:${TOKEN}@github.com/${REPO}.git" build-log
+
+  deploy:
+    needs: [plan, data]
+    if: always() && needs.plan.result == 'success' && needs.data.result != 'failure' && needs.data.result != 'cancelled'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp index.html _site/
+          if git fetch -q --depth 1 origin map-data; then
+            git archive FETCH_HEAD data | tar -x -C _site
+          else
+            echo "No map data yet; publishing the page on its own."
+          fi
+          du -sh _site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

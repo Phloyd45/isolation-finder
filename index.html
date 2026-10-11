@@ -170,6 +170,7 @@ a{color:var(--accent)}
       <summary>How this works and what it misses</summary>
       <p>Populated areas are the residential zones mapped in OpenStreetMap, plus any village, town or city point, plus any cluster of buildings that looks like an unmapped village. Everything else is a lone house.</p>
       <p>Unmapped homes do not appear, and untagged buildings include barns and sheds, so tick the box above off for a stricter picture. Distances are straight lines. Check the satellite view before you trust any spot, and respect land access.</p>
+      <p id="dataInfo">Inside Great Britain the map uses ready-made data built each month from OpenStreetMap. Anywhere else it asks the live OpenStreetMap server, which is slower.</p>
       <p>Set a radius to zero to ignore that kind of place. Each scan covers your search radius around the map centre, plus a margin as wide as your largest radius so the edges stay accurate. Areas you scan are saved on this device for 30 days, so scanning the same or a nearby area again only downloads what is missing.</p>
     </details>
     </div>
@@ -599,6 +600,36 @@ function findSpots(xs, ys, cls, radii, inner, fetched, count, inside){
   /* Saved data. The map is cut into fixed tiles about 11 km across (0.1° by 0.16°). Each tile downloaded is
      kept in this browser for 30 days, so scanning the same or an overlapping area only fetches tiles not yet saved. */
   const TLAT=0.1, TLON=0.16, KEEP=30*864e5;
+
+  /* Ready-made tiles published with this site, built monthly from the Great Britain map file.
+     Inside their coverage they replace the live server; anywhere else the live server is used. */
+  let dixP=null;
+  function dataIndex(){
+    if(!dixP) dixP=fetch('data/index.json',{cache:'no-cache'})
+      .then(r=>r.ok?r.json():null)
+      .then(j=>(j&&j.v===1&&j.tlat===TLAT&&j.tlon===TLON)?{built:j.built,covered:new Set(j.covered),files:new Set(j.files)}:null)
+      .catch(()=>null);
+    return dixP;
+  }
+  function decodeTile(j,i,jj,built){
+    const oi=i*10000, oj=jj*16000, v={t:Date.now(),b:built,h:[],p:[],a:[]};
+    const pts=(arr,flag)=>{ let a=oi,b=oj; for(let k=0;k<arr.length;k+=2){ a+=arr[k]; b+=arr[k+1]; v.h.push(a/1e5,b/1e5,flag); } };
+    pts(j.h||[],0); pts(j.y||[],1);
+    for(const p of j.p||[]) v.p.push([p[0]/1e5,p[1]/1e5,p[2],p[3]]);
+    for(const [id,r] of j.a||[]){
+      const flat=[]; let a=oi,b=oj;
+      for(let k=0;k<r.length;k+=2){ a+=r[k]; b+=r[k+1]; flat.push(a/1e5,b/1e5); }
+      v.a.push(['g'+id,flat]);
+    }
+    return v;
+  }
+  async function siteTile(key,dix){
+    if(!dix.files.has(key)) return {t:Date.now(),b:dix.built,h:[],p:[],a:[]};  /* covered but empty, such as open sea */
+    const [i,jj]=key.split('_').map(Number);
+    const r=await fetch('data/t/'+key+'.json');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return decodeTile(await r.json(),i,jj,dix.built);
+  }
   const mem=new Map();
   let dbp=null;
   function idb(){
@@ -648,11 +679,24 @@ function findSpots(xs, ys, cls, radii, inner, fetched, count, inside){
       const la=Math.min(Math.max(circ.lat,i*TLAT),(i+1)*TLAT), lo=Math.min(Math.max(circ.lon,j*TLON),(j+1)*TLON);
       return Math.hypot((la-circ.lat)*110574,(lo-circ.lon)*kxc)<=circ.r;
     };
-    const tiles=new Map(), missing=[];
+    const dix=await dataIndex();
+    const tiles=new Map(), missing=[], fromSite=[];
     for(let i=i0;i<=i1;i++) for(let j=j0;j<=j1;j++){
       if(!touches(i,j)) continue;
-      const key=i+'_'+j, v=await getTile(key);
-      if(v) tiles.set(key,v); else missing.push([i,j]);
+      const key=i+'_'+j, onSite=!!(dix&&dix.covered.has(key));
+      let v=await getTile(key);
+      if(v&&onSite&&v.b!==dix.built) v=null;  /* a newer monthly build replaces older saved tiles */
+      if(v) tiles.set(key,v); else if(onSite) fromSite.push(key); else missing.push([i,j]);
+    }
+    /* ready-made tiles are plain files on this site, so fetch six at a time; any that fail go to the live server */
+    for(let k=0;k<fromSite.length;k+=6){
+      const batch=fromSite.slice(k,k+6);
+      setStatus('Loading map data '+Math.min(k+6,fromSite.length)+' of '+fromSite.length+'…');
+      const got=await Promise.allSettled(batch.map(key=>siteTile(key,dix)));
+      for(let x=0;x<batch.length;x++){
+        if(got[x].status==='fulfilled'){ await putTile(batch[x],got[x].value); tiles.set(batch[x],got[x].value); }
+        else missing.push(batch[x].split('_').map(Number));
+      }
     }
     const blocks=[];
     for(let bi=i0;bi<=i1;bi+=2) for(let bj=j0;bj<=j1;bj+=2){
@@ -690,7 +734,7 @@ function findSpots(xs, ys, cls, radii, inner, fetched, count, inside){
       for(const [key,v] of fresh){ await putTile(key,v); tiles.set(key,v); }
       if(k<blocks.length-1) await sleep(1000);
     }
-    const out={homes:[],places:[],areas:new Map(),downloaded:blocks.length,
+    const out={homes:[],places:[],areas:new Map(),downloaded:blocks.length+fromSite.length,live:blocks.length,
                bounds:{s:i0*TLAT,n:(i1+1)*TLAT,w:j0*TLON,e:(j1+1)*TLON}};
     for(const v of tiles.values()){
       for(let x=0;x<v.h.length;x+=3) out.homes.push({lat:v.h[x],lon:v.h[x+1],untagged:v.h[x+2]===1});
@@ -827,6 +871,7 @@ function findSpots(xs, ys, cls, radii, inner, fetched, count, inside){
   };
 
   $('scan').onclick=()=>scan();
+  dataIndex().then(d=>{ if(d) $('dataInfo').textContent='Inside Great Britain the map uses ready-made data from OpenStreetMap, last built '+new Date(d.built).toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})+'. Anywhere else it asks the live OpenStreetMap server, which is slower.'; });
   setStatus('Search a town or postcode to start, or move the map and tap Scan.');
 })();
 </script>
