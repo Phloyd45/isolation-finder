@@ -144,11 +144,15 @@ a{color:var(--accent)}
       <ol class="spots" id="spots"><li class="sub">Run a scan to see them.</li></ol>
     </div>
 
+    <div class="row">
+      <button class="btn" type="button" id="clearCache">Clear saved map data</button>
+    </div>
+
     <details>
       <summary>How this works and what it misses</summary>
-      <p>Populated areas are the residential zones mapped in OpenStreetMap, plus any village, town or city point, plus any cluster of buildings that looks like an unmapped village. Buildings inside a mapped zone are never downloaded, which keeps scans small. Everything else is a lone house.</p>
+      <p>Populated areas are the residential zones mapped in OpenStreetMap, plus any village, town or city point, plus any cluster of buildings that looks like an unmapped village. Everything else is a lone house.</p>
       <p>Unmapped homes do not appear, and untagged buildings include barns and sheds, so tick the box above off for a stricter picture. Distances are straight lines. Check the satellite view before you trust any spot, and respect land access.</p>
-      <p>Each scan covers your chosen radius around the map centre, plus a mile and a half margin so the edges stay accurate. It loads in small parts, and smaller radii load faster.</p>
+      <p>Each scan covers your chosen radius around the map centre, plus a mile and a half margin so the edges stay accurate. Areas you scan are saved on this device for 30 days, so scanning the same or a nearby area again only downloads what is missing.</p>
     </details>
     </div>
   </aside>
@@ -517,34 +521,100 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
       '.p out qt;.r out skel geom qt;';
   }
 
-  /* Squares of up to ~24 km, one after another, so a 5 mile scan is a single request. */
+  /* Saved data. The map is cut into fixed tiles about 11 km across (0.1° by 0.16°). Each tile downloaded is
+     kept in this browser for 30 days, so scanning the same or an overlapping area only fetches tiles not yet saved. */
+  const TLAT=0.1, TLON=0.16, KEEP=30*864e5;
+  const mem=new Map();
+  let dbp=null;
+  function idb(){
+    if(dbp) return dbp;
+    dbp=new Promise(res=>{
+      try{
+        const r=indexedDB.open('isolation-finder',1);
+        r.onupgradeneeded=()=>r.result.createObjectStore('tiles');
+        r.onsuccess=()=>res(r.result);
+        r.onerror=()=>res(null);
+        r.onblocked=()=>res(null);
+      }catch(e){ res(null); }
+    });
+    return dbp;
+  }
+  async function getTile(key){
+    if(mem.has(key)) return mem.get(key);
+    const db=await idb(); if(!db) return null;
+    return new Promise(res=>{
+      try{
+        const q=db.transaction('tiles').objectStore('tiles').get(key);
+        q.onsuccess=()=>{ const v=q.result; if(v&&Date.now()-v.t<KEEP){ mem.set(key,v); res(v); } else res(null); };
+        q.onerror=()=>res(null);
+      }catch(e){ res(null); }
+    });
+  }
+  async function putTile(key,v){
+    mem.set(key,v);
+    const db=await idb(); if(!db) return;
+    try{ db.transaction('tiles','readwrite').objectStore('tiles').put(v,key); }catch(e){}
+  }
+  async function clearTiles(){
+    mem.clear();
+    const db=await idb(); if(!db) return;
+    await new Promise(res=>{
+      try{ const tx=db.transaction('tiles','readwrite'); tx.objectStore('tiles').clear(); tx.oncomplete=res; tx.onerror=res; }
+      catch(e){ res(); }
+    });
+  }
+
+  /* Load every tile the scan needs: saved ones straight from the browser, missing ones from the server
+     in blocks of up to 2 by 2 tiles, one request at a time. */
   async function loadAll(f){
-    const midLat=(f.s+f.n)/2, kx=111320*Math.cos(midLat*Math.PI/180), SIZE=24000;
-    const nLat=Math.max(1,Math.ceil((f.n-f.s)*110574/SIZE)), nLon=Math.max(1,Math.ceil((f.e-f.w)*kx/SIZE));
-    const dLat=(f.n-f.s)/nLat, dLon=(f.e-f.w)/nLon, jobs=[];
-    for(let i=0;i<nLat;i++) for(let j=0;j<nLon;j++) jobs.push([f.s+i*dLat,f.w+j*dLon,f.s+(i+1)*dLat,f.w+(j+1)*dLon]);
-    const out={homes:new Map(),places:new Map(),areas:new Map()};
-    for(let k=0;k<jobs.length;k++){
-      const [s,w,n,e]=jobs[k], label=jobs.length>1?'part '+(k+1)+' of '+jobs.length:'';
-      setStatus(label?'Loading '+label+'…':'Loading homes and populated areas…');
-      const j=await overpass(buildQuery(s,w,n,e),label);
+    const i0=Math.floor(f.s/TLAT), i1=Math.floor(f.n/TLAT), j0=Math.floor(f.w/TLON), j1=Math.floor(f.e/TLON);
+    const tiles=new Map(), missing=[];
+    for(let i=i0;i<=i1;i++) for(let j=j0;j<=j1;j++){
+      const key=i+'_'+j, v=await getTile(key);
+      if(v) tiles.set(key,v); else missing.push([i,j]);
+    }
+    const blocks=[];
+    for(let bi=i0;bi<=i1;bi+=2) for(let bj=j0;bj<=j1;bj+=2){
+      const inB=missing.filter(([i,j])=>i>=bi&&i<=Math.min(bi+1,i1)&&j>=bj&&j<=Math.min(bj+1,j1));
+      if(!inB.length) continue;
+      blocks.push([Math.min(...inB.map(t=>t[0])),Math.max(...inB.map(t=>t[0])),Math.min(...inB.map(t=>t[1])),Math.max(...inB.map(t=>t[1]))]);
+    }
+    for(let k=0;k<blocks.length;k++){
+      const [a0,a1,b0,b1]=blocks[k], label=blocks.length>1?'part '+(k+1)+' of '+blocks.length:'';
+      setStatus(label?'Downloading '+label+'…':'Downloading homes and populated areas…');
+      const j=await overpass(buildQuery(a0*TLAT,b0*TLON,(a1+1)*TLAT,(b1+1)*TLON),label);
+      const fresh=new Map(), now=Date.now();
+      for(let i=a0;i<=a1;i++) for(let jj=b0;jj<=b1;jj++) fresh.set(i+'_'+jj,{t:now,h:[],p:[],a:[]});
+      const tileOf=(la,lo)=>fresh.get(Math.floor(la/TLAT)+'_'+Math.floor(lo/TLON));
       let section=0;
       for(const el of j.elements){
         if(el.type==='count'){ section++; continue; }
-        const key=el.type+el.id;
         if(section<2){
-          const lat=el.lat!==undefined?el.lat:(el.center&&el.center.lat), lon=el.lon!==undefined?el.lon:(el.center&&el.center.lon);
-          if(lat===undefined||lon===undefined) continue;
-          out.homes.set(key,{lat,lon,untagged:section===1});
+          const la=el.lat!==undefined?el.lat:(el.center&&el.center.lat), lo=el.lon!==undefined?el.lon:(el.center&&el.center.lon);
+          if(la===undefined||lo===undefined) continue;
+          const t=tileOf(la,lo); if(t) t.h.push(la,lo,section===1?1:0);
         }else if(el.type==='node'){
-          const t=el.tags||{};
-          if(t.place==='isolated_dwelling') out.homes.set(key,{lat:el.lat,lon:el.lon,untagged:false});
-          else out.places.set(key,{lat:el.lat,lon:el.lon,ptype:t.place||'',name:t.name||''});
+          const t=tileOf(el.lat,el.lon); if(!t) continue;
+          const tg=el.tags||{};
+          if(tg.place==='isolated_dwelling') t.h.push(el.lat,el.lon,0);
+          else t.p.push([el.lat,el.lon,tg.place||'',tg.name||'']);
         }else if(el.type==='way'&&el.geometry&&el.geometry.length>=3){
-          out.areas.set(key,el.geometry);
+          const flat=[]; let la0=90,la1=-90,lo0=180,lo1=-180;
+          for(const g of el.geometry){ flat.push(g.lat,g.lon); la0=Math.min(la0,g.lat); la1=Math.max(la1,g.lat); lo0=Math.min(lo0,g.lon); lo1=Math.max(lo1,g.lon); }
+          for(let i=Math.max(a0,Math.floor(la0/TLAT)); i<=Math.min(a1,Math.floor(la1/TLAT)); i++)
+            for(let jj=Math.max(b0,Math.floor(lo0/TLON)); jj<=Math.min(b1,Math.floor(lo1/TLON)); jj++)
+              fresh.get(i+'_'+jj).a.push([el.id,flat]);
         }
       }
-      if(k<jobs.length-1) await sleep(1500);
+      for(const [key,v] of fresh){ await putTile(key,v); tiles.set(key,v); }
+      if(k<blocks.length-1) await sleep(1000);
+    }
+    const out={homes:[],places:[],areas:new Map(),downloaded:blocks.length,
+               bounds:{s:i0*TLAT,n:(i1+1)*TLAT,w:j0*TLON,e:(j1+1)*TLON}};
+    for(const v of tiles.values()){
+      for(let x=0;x<v.h.length;x+=3) out.homes.push({lat:v.h[x],lon:v.h[x+1],untagged:v.h[x+2]===1});
+      for(const p of v.p) out.places.push({lat:p[0],lon:p[1],ptype:p[2],name:p[3]});
+      for(const [id,flat] of v.a) if(!out.areas.has(id)) out.areas.set(id,flat);
     }
     return out;
   }
@@ -567,8 +637,9 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
 
       /* mapped populated areas */
       const polys=[];
-      for(const g of data.areas.values()){
-        const ll=g.map(p=>[p.lat,p.lon]);
+      for(const flat of data.areas.values()){
+        const ll=[];
+        for(let k=0;k<flat.length;k+=2) ll.push([flat[k],flat[k+1]]);
         if(ll[0][0]===ll[ll.length-1][0]&&ll[0][1]===ll[ll.length-1][1]) ll.pop();
         if(ll.length<3) continue;
         const xy=ll.map(p=>proj.fwd(p[0],p[1]));
@@ -580,11 +651,11 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
       const inside=makePolyTest(polys,1000);
       /* settlement points, then homes that sit outside every mapped populated area */
       const homes=[];
-      for(const p of data.places.values()){
+      for(const p of data.places){
         const [x,y]=proj.fwd(p.lat,p.lon);
         homes.push({lat:p.lat,lon:p.lon,x,y,place:true,ptype:p.ptype,name:p.name,untagged:false});
       }
-      for(const h of data.homes.values()){
+      for(const h of data.homes){
         const [x,y]=proj.fwd(h.lat,h.lon);
         if(inside(x,y)) continue;
         homes.push({lat:h.lat,lon:h.lon,x,y,place:false,ptype:'',name:'',untagged:h.untagged});
@@ -592,9 +663,10 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
       state.homes=homes; state.polys=polys; state.inside=inside; state.proj=proj; state.scanned=true;
       state.circle={lat,lon,r:R};
       state.innerXY={minX:-R,minY:-R,maxX:R,maxY:R,circle:{x:0,y:0,r:R}};
-      const f1=proj.fwd(f.s,f.w), f2=proj.fwd(f.n,f.e);
+      const cb=data.bounds, f1=proj.fwd(cb.s,cb.w), f2=proj.fwd(cb.n,cb.e);
       state.fetchXY={minX:f1[0],minY:f1[1],maxX:f2[0],maxY:f2[1]};
       reclassify();
+      if(!data.downloaded) setStatus($('status').textContent+' Loaded from data saved on this device.');
     }catch(e){
       const codes=e.codes||[];
       let hint;
@@ -608,6 +680,7 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
     }
   }
 
+  $('clearCache').onclick=async()=>{ await clearTiles(); setStatus('Saved map data cleared. The next scan downloads fresh data.'); };
   ['showRemote','showRadii','showHomes'].forEach(id=>$(id).onchange=()=>cover.redraw());
   ['incUntagged','incHamlets'].forEach(id=>$(id).onchange=reclassify);
   $('minN').oninput=()=>{$('minNOut').textContent=$('minN').value;};
