@@ -252,7 +252,30 @@ function nearestBoth(idx, xs, ys, cluster, x, y, limit){
 }
 
 /* Grid-search the circle for points furthest outside both radii. */
-function findSpots(xs, ys, cluster, inner, fetched, count, polys){
+/* Grid index over polygon bounding boxes, so testing thousands of points stays fast. */
+function makePolyTest(polys, cell){
+  const m=new Map();
+  polys.forEach((p,i)=>{
+    const b=p.bb;
+    for(let gx=Math.floor(b[0]/cell); gx<=Math.floor(b[2]/cell); gx++)
+      for(let gy=Math.floor(b[1]/cell); gy<=Math.floor(b[3]/cell); gy++){
+        const k=gx+','+gy, a=m.get(k);
+        if(a) a.push(i); else m.set(k,[i]);
+      }
+  });
+  return (x,y)=>{
+    const a=m.get(Math.floor(x/cell)+','+Math.floor(y/cell));
+    if(!a) return false;
+    for(const i of a){
+      const b=polys[i].bb;
+      if(x<b[0]||x>b[2]||y<b[1]||y>b[3]) continue;
+      if(pointInPoly(x,y,polys[i].xy)) return true;
+    }
+    return false;
+  };
+}
+
+function findSpots(xs, ys, cluster, inner, fetched, count, inside){
   const CELL = 2*MI, idx = buildIndex(xs, ys, CELL);
   const w = inner.maxX-inner.minX, h = inner.maxY-inner.minY;
   const step = Math.max(150, Math.sqrt(w*h/20000));
@@ -260,7 +283,7 @@ function findSpots(xs, ys, cluster, inner, fetched, count, polys){
   for(let x=inner.minX+step/2; x<inner.maxX; x+=step){
     for(let y=inner.minY+step/2; y<inner.maxY; y+=step){
       if(inner.circle && Math.hypot(x-inner.circle.x, y-inner.circle.y)>inner.circle.r) continue;
-      if(polys && polys.length && inAnyPoly(polys,x,y)) continue;
+      if(inside && inside(x,y)) continue;
       const limit = Math.min(x-fetched.minX, fetched.maxX-x, y-fetched.minY, fetched.maxY-y);
       if(limit<=0) continue;
       const r = nearestBoth(idx, xs, ys, cluster, x, y, limit);
@@ -283,10 +306,10 @@ function findSpots(xs, ys, cluster, inner, fetched, count, polys){
 (function(){
   const $ = id => document.getElementById(id);
   const MIRRORS=['https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
-  const state={homes:[],active:[],cluster:null,polys:[],proj:null,circle:null,innerXY:null,fetchXY:null,scanned:false,busy:false};
+  const state={homes:[],active:[],cluster:null,polys:[],inside:null,proj:null,circle:null,innerXY:null,fetchXY:null,scanned:false,busy:false};
   const small=window.matchMedia('(max-width:900px)');
 
-  const map=L.map('map',{zoomControl:true}).setView([52.27,-3.64],11);
+  const map=L.map('map',{zoomControl:true}).setView([54.3,-2.6],6);
   /* Esri and CARTO tiles load without a referrer, so they work when the file is opened straight from the device. */
   const bases={
     topo:L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,maxNativeZoom:17,attribution:'Tiles &copy; Esri'}),
@@ -415,10 +438,10 @@ function findSpots(xs, ys, cluster, inner, fetched, count, polys){
     const X=new Float64Array(total), Y=new Float64Array(total), C=new Uint8Array(total);
     X.set(xs); Y.set(ys); C.set(state.cluster);
     X.set(ext.xs,n); Y.set(ext.ys,n); C.fill(1,n);
-    const spots=findSpots(X,Y,C,state.innerXY,state.fetchXY,8,state.polys);
+    const spots=findSpots(X,Y,C,state.innerXY,state.fetchXY,8,state.inside);
     const good=renderSpots(spots);
     const lone=state.cluster.reduce((a,v)=>a+(v?0:1),0);
-    setStatus(good?good+' remote spot'+(good===1?'':'s')+' found. '+state.polys.length+' populated areas outlined, '+lone.toLocaleString()+' lone houses outside them.'
+    setStatus(good?good+' remote spot'+(good===1?'':'s')+' found. '+state.polys.length+' populated area'+(state.polys.length===1?'':'s')+' outlined, '+lone.toLocaleString()+' lone house'+(lone===1?'':'s')+' outside them.'
                   :'No remote spot in this circle. Try a different place or a larger radius.');
   }
 
@@ -442,66 +465,88 @@ function findSpots(xs, ys, cluster, inner, fetched, count, polys){
     return good.length;
   }
 
-  async function overpass(q){
-    const errs=[];
-    for(const url of MIRRORS){
-      const host=url.split('/')[2];
-      try{
-        const ctl=new AbortController(), to=setTimeout(()=>ctl.abort(),110000);
-        /* overpass-api.de refuses requests with no Referer (HTTP 406 without CORS, seen as "Failed to fetch"). */
-        const res=await fetch(url+'?data='+encodeURIComponent(q),{signal:ctl.signal,referrerPolicy:'origin'});
-        clearTimeout(to);
-        if(!res.ok) throw new Error('HTTP '+res.status);
-        const j=await res.json();
-        if(j.remark&&/error|timed out/i.test(j.remark)) throw new Error('server ran out of time');
-        return j;
-      }catch(e){errs.push(host+': '+(e.message||e));}
-    }
-    throw new Error(errs.join('; '));
-  }
-
-  const BTYPES='^(house|residential|detached|semidetached_house|terrace|bungalow|apartments|farm|cabin|static_caravan|dormitory|yes)$';
-  const bbox=(s,w,n,e)=>'('+[s,w,n,e].map(v=>v.toFixed(5)).join(',')+')';
-  /* Light query: mapped residential zones come back as outlines, and only buildings outside them come back as points. */
-  function qOutside(s,w,n,e){
-    const bb=bbox(s,w,n,e);
-    return '[out:json][timeout:60];'+
-      'way["landuse"="residential"]'+bb+'->.rw;.rw map_to_area->.ra;'+
-      'nwr["building"~"'+BTYPES+'"]'+bb+'->.b;nwr.b(area.ra)->.inside;(.b;-.inside;)->.outb;'+
-      '(.outb;nwr["place"="isolated_dwelling"]'+bb+';node["place"~"^(city|town|village|hamlet)$"]'+bb+';);'+
-      'out center qt;.rw out geom qt;';
-  }
-  /* Fallback: every building, filtered against the outlines in the browser instead. */
-  function qPlain(s,w,n,e){
-    const bb=bbox(s,w,n,e);
-    return '[out:json][timeout:60];('+
-      'nwr["building"~"'+BTYPES+'"]'+bb+';nwr["place"="isolated_dwelling"]'+bb+';node["place"~"^(city|town|village|hamlet)$"]'+bb+';'+
-      ');out center qt;way["landuse"="residential"]'+bb+';out geom qt;';
-  }
   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+  async function countdown(sec,msg){
+    for(let t=sec;t>0;t--){ setStatus(msg+' Trying again in '+t+' s…'); await sleep(1000); }
+  }
 
-  /* Fetch in ~8 km squares, two at a time, so no single request is heavy enough to be refused. */
-  async function loadAll(f){
-    const midLat=(f.s+f.n)/2, kx=111320*Math.cos(midLat*Math.PI/180);
-    const nLat=Math.max(1,Math.ceil((f.n-f.s)*110574/8000)), nLon=Math.max(1,Math.ceil((f.e-f.w)*kx/8000));
-    const dLat=(f.n-f.s)/nLat, dLon=(f.e-f.w)/nLon, jobs=[];
-    for(let i=0;i<nLat;i++) for(let j=0;j<nLon;j++) jobs.push([f.s+i*dLat,f.w+j*dLon,f.s+(i+1)*dLat,f.w+(j+1)*dLon]);
-    const seen=new Map(); let done=0, next=0;
-    async function worker(){
-      while(next<jobs.length){
-        const [s,w,n,e]=jobs[next++];
-        let j;
-        try{ j=await overpass(qOutside(s,w,n,e)); }
-        catch(e1){
-          try{ j=await overpass(qPlain(s,w,n,e)); }
-          catch(e2){ await sleep(2000); j=await overpass(qPlain(s,w,n,e)); }
+  /* One request at a time. The main server answers 429 (too many requests) or 504 (overloaded) when busy,
+     so wait and retry it a few times before trying the backup servers. */
+  async function overpass(q,label){
+    const errs=[];
+    for(let m=0;m<MIRRORS.length;m++){
+      const url=MIRRORS[m], host=url.split('/')[2], waits=m===0?[10,25,45]:[];
+      for(let attempt=0;;attempt++){
+        let res;
+        try{
+          const ctl=new AbortController(), to=setTimeout(()=>ctl.abort(),150000);
+          /* overpass-api.de refuses requests with no Referer (HTTP 406 without CORS, seen as "Failed to fetch"). */
+          res=await fetch(url+'?data='+encodeURIComponent(q),{signal:ctl.signal,referrerPolicy:'origin'});
+          clearTimeout(to);
+        }catch(e){ errs.push({host,code:e.name==='AbortError'?'slow':'net'}); break; }
+        if((res.status===429||res.status===504)&&attempt<waits.length){
+          await countdown(waits[attempt],(res.status===429?'The free data server is busy.':'The free data server is overloaded.')+(label?' (loading '+label+')':''));
+          continue;
         }
-        for(const el of j.elements) seen.set(el.type+el.id,el);
-        done++; setStatus('Loaded part '+done+' of '+jobs.length+'…');
+        if(!res.ok){ errs.push({host,code:res.status}); break; }
+        let j;
+        try{ j=await res.json(); }catch(e){ errs.push({host,code:'bad'}); break; }
+        if(j.remark&&/runtime error|timed out|out of memory/i.test(j.remark)){ errs.push({host,code:'heavy'}); break; }
+        return j;
       }
     }
-    await Promise.all([worker(),worker()]);
-    return Array.from(seen.values());
+    const err=new Error(errs.map(x=>x.host+': '+(typeof x.code==='number'?'HTTP '+x.code:x.code)).join('; '));
+    err.codes=errs.map(x=>x.code);
+    throw err;
+  }
+
+  const HOME_TYPES='^(house|residential|detached|semidetached_house|terrace|bungalow|apartments|farm|cabin|static_caravan|dormitory)$';
+  const bbox=(s,w,n,e)=>'('+[s,w,n,e].map(v=>v.toFixed(5)).join(',')+')';
+  /* Light query: no tags on buildings, sections split by "out count" markers.
+     Section 0: buildings tagged as homes. Section 1: buildings tagged only building=yes.
+     Section 2: settlement and isolated-dwelling points, then residential area outlines. */
+  function buildQuery(s,w,n,e){
+    const bb=bbox(s,w,n,e);
+    return '[out:json][timeout:120];'+
+      'nwr["building"~"'+HOME_TYPES+'"]'+bb+'->.h;'+
+      'nwr["building"="yes"]'+bb+'->.y;'+
+      'node["place"~"^(city|town|village|hamlet|isolated_dwelling)$"]'+bb+'->.p;'+
+      'way["landuse"="residential"]'+bb+'->.r;'+
+      '.h out skel center qt;.h out count;'+
+      '.y out skel center qt;.y out count;'+
+      '.p out qt;.r out skel geom qt;';
+  }
+
+  /* Squares of up to ~24 km, one after another, so a 5 mile scan is a single request. */
+  async function loadAll(f){
+    const midLat=(f.s+f.n)/2, kx=111320*Math.cos(midLat*Math.PI/180), SIZE=24000;
+    const nLat=Math.max(1,Math.ceil((f.n-f.s)*110574/SIZE)), nLon=Math.max(1,Math.ceil((f.e-f.w)*kx/SIZE));
+    const dLat=(f.n-f.s)/nLat, dLon=(f.e-f.w)/nLon, jobs=[];
+    for(let i=0;i<nLat;i++) for(let j=0;j<nLon;j++) jobs.push([f.s+i*dLat,f.w+j*dLon,f.s+(i+1)*dLat,f.w+(j+1)*dLon]);
+    const out={homes:new Map(),places:new Map(),areas:new Map()};
+    for(let k=0;k<jobs.length;k++){
+      const [s,w,n,e]=jobs[k], label=jobs.length>1?'part '+(k+1)+' of '+jobs.length:'';
+      setStatus(label?'Loading '+label+'…':'Loading homes and populated areas…');
+      const j=await overpass(buildQuery(s,w,n,e),label);
+      let section=0;
+      for(const el of j.elements){
+        if(el.type==='count'){ section++; continue; }
+        const key=el.type+el.id;
+        if(section<2){
+          const lat=el.lat!==undefined?el.lat:(el.center&&el.center.lat), lon=el.lon!==undefined?el.lon:(el.center&&el.center.lon);
+          if(lat===undefined||lon===undefined) continue;
+          out.homes.set(key,{lat,lon,untagged:section===1});
+        }else if(el.type==='node'){
+          const t=el.tags||{};
+          if(t.place==='isolated_dwelling') out.homes.set(key,{lat:el.lat,lon:el.lon,untagged:false});
+          else out.places.set(key,{lat:el.lat,lon:el.lon,ptype:t.place||'',name:t.name||''});
+        }else if(el.type==='way'&&el.geometry&&el.geometry.length>=3){
+          out.areas.set(key,el.geometry);
+        }
+      }
+      if(k<jobs.length-1) await sleep(1500);
+    }
+    return out;
   }
 
   async function scan(lat,lon){
@@ -518,47 +563,45 @@ function findSpots(xs, ys, cluster, inner, fetched, count, polys){
       L.circle([lat,lon],{radius:R,color:'#2f9e62',weight:2,fill:false,dashArray:'6 6',interactive:false}).addTo(ringLayer);
       const mLat=1.5*MI/110574, mLon=1.5*MI/(111320*Math.cos(lat*Math.PI/180));
       const f={s:box.getSouth()-mLat,w:box.getWest()-mLon,n:box.getNorth()+mLat,e:box.getEast()+mLon};
-      const elements=await loadAll(f);
+      const data=await loadAll(f);
 
       /* mapped populated areas */
       const polys=[];
-      for(const el of elements){
-        if(el.type==='way'&&el.tags&&el.tags.landuse==='residential'&&el.geometry&&el.geometry.length>=3){
-          const ll=el.geometry.map(g=>[g.lat,g.lon]);
-          if(ll[0][0]===ll[ll.length-1][0]&&ll[0][1]===ll[ll.length-1][1]) ll.pop();
-          const xy=ll.map(p=>proj.fwd(p[0],p[1]));
-          const bb=[Infinity,Infinity,-Infinity,-Infinity], lbb=[Infinity,Infinity,-Infinity,-Infinity];
-          xy.forEach(q=>{bb[0]=Math.min(bb[0],q[0]);bb[1]=Math.min(bb[1],q[1]);bb[2]=Math.max(bb[2],q[0]);bb[3]=Math.max(bb[3],q[1]);});
-          ll.forEach(p=>{lbb[0]=Math.min(lbb[0],p[0]);lbb[1]=Math.min(lbb[1],p[1]);lbb[2]=Math.max(lbb[2],p[0]);lbb[3]=Math.max(lbb[3],p[1]);});
-          polys.push({ll,xy,bb,lbb});
-        }
+      for(const g of data.areas.values()){
+        const ll=g.map(p=>[p.lat,p.lon]);
+        if(ll[0][0]===ll[ll.length-1][0]&&ll[0][1]===ll[ll.length-1][1]) ll.pop();
+        if(ll.length<3) continue;
+        const xy=ll.map(p=>proj.fwd(p[0],p[1]));
+        const bb=[Infinity,Infinity,-Infinity,-Infinity], lbb=[Infinity,Infinity,-Infinity,-Infinity];
+        xy.forEach(q=>{bb[0]=Math.min(bb[0],q[0]);bb[1]=Math.min(bb[1],q[1]);bb[2]=Math.max(bb[2],q[0]);bb[3]=Math.max(bb[3],q[1]);});
+        ll.forEach(p=>{lbb[0]=Math.min(lbb[0],p[0]);lbb[1]=Math.min(lbb[1],p[1]);lbb[2]=Math.max(lbb[2],p[0]);lbb[3]=Math.max(lbb[3],p[1]);});
+        polys.push({ll,xy,bb,lbb});
       }
-      /* homes outside them, and settlement points */
+      const inside=makePolyTest(polys,1000);
+      /* settlement points, then homes that sit outside every mapped populated area */
       const homes=[];
-      for(const el of elements){
-        const t=el.tags||{};
-        if(t.landuse==='residential'&&el.geometry) continue;
-        const lat2=el.lat!==undefined?el.lat:(el.center&&el.center.lat), lon2=el.lon!==undefined?el.lon:(el.center&&el.center.lon);
-        if(lat2===undefined||lon2===undefined) continue;
-        const isPlace=el.type==='node'&&/^(city|town|village|hamlet)$/.test(t.place||'');
-        const [x,y]=proj.fwd(lat2,lon2);
-        if(!isPlace&&inAnyPoly(polys,x,y)) continue;
-        homes.push({lat:lat2,lon:lon2,x,y,place:isPlace,ptype:isPlace?t.place:'',name:t.name||'',untagged:!isPlace&&t.building==='yes'&&t.place!=='isolated_dwelling'});
+      for(const p of data.places.values()){
+        const [x,y]=proj.fwd(p.lat,p.lon);
+        homes.push({lat:p.lat,lon:p.lon,x,y,place:true,ptype:p.ptype,name:p.name,untagged:false});
       }
-      state.homes=homes; state.polys=polys; state.proj=proj; state.scanned=true;
+      for(const h of data.homes.values()){
+        const [x,y]=proj.fwd(h.lat,h.lon);
+        if(inside(x,y)) continue;
+        homes.push({lat:h.lat,lon:h.lon,x,y,place:false,ptype:'',name:'',untagged:h.untagged});
+      }
+      state.homes=homes; state.polys=polys; state.inside=inside; state.proj=proj; state.scanned=true;
       state.circle={lat,lon,r:R};
       state.innerXY={minX:-R,minY:-R,maxX:R,maxY:R,circle:{x:0,y:0,r:R}};
       const f1=proj.fwd(f.s,f.w), f2=proj.fwd(f.n,f.e);
       state.fetchXY={minX:f1[0],minY:f1[1],maxX:f2[0],maxY:f2[1]};
       reclassify();
     }catch(e){
+      const codes=e.codes||[];
       let hint;
-      if(!/^https?:$/.test(location.protocol)){
-        hint='This page is open as a file from your device, and the data servers refuse requests that do not come from a website. Open it from its web address instead.';
-      }else{
-        try{ await overpass('[out:json][timeout:10];node(1);out;'); hint='The data servers are reachable, so the area was too heavy. Try a smaller radius.'; }
-        catch(_){ hint='This browser could not reach any data server. Try again in a few minutes.'; }
-      }
+      if(!/^https?:$/.test(location.protocol)) hint='This page is open as a file from your device, and the data servers refuse requests that do not come from a website. Open it from its web address instead.';
+      else if(codes.includes(429)) hint='The free data server is still busy. Wait two or three minutes, then scan again.';
+      else if(codes.includes(504)||codes.includes('heavy')||codes.includes('slow')) hint='The free data server is overloaded right now. Try again in a few minutes, or use a smaller radius.';
+      else hint='The data servers could not be reached. Check your connection and try again.';
       setStatus('The scan failed. '+hint+' ('+(e.message||e)+')',true);
     }finally{
       state.busy=false; $('scan').disabled=false;
@@ -598,7 +641,7 @@ function findSpots(xs, ys, cluster, inner, fetched, count, polys){
   };
 
   $('scan').onclick=()=>scan();
-  scan(52.27,-3.64);
+  setStatus('Search a town or postcode to start, or move the map and tap Scan.');
 })();
 </script>
 </body>
