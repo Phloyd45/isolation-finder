@@ -43,7 +43,7 @@ input[type=search],select{font-size:16px}
 select{padding:0 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font-family:inherit}
 input[type=checkbox]{width:20px;height:20px;flex:none}
 .opts label{min-height:32px}
-input[type=range]{width:100%;min-height:32px}
+input[type=range]{width:100%;min-height:32px;accent-color:var(--accent)}
 .leaflet-touch .leaflet-bar a{width:40px;height:40px;line-height:40px}
 @media (max-width:900px){
   .app{flex-direction:column}
@@ -85,6 +85,15 @@ details{color:var(--muted);font-size:13px}
 details p{margin:8px 0 0}
 a{color:var(--accent)}
 .cover{pointer-events:none}
+.grow{flex:1 1 220px;min-width:0}
+.kv{display:flex;justify-content:space-between;align-items:baseline;gap:4px 10px;flex-wrap:wrap}
+.kv output{font:500 13px var(--mono);color:var(--accent);font-variant-numeric:tabular-nums}
+.radii{display:grid;gap:12px}
+.radhead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.radhead h2{margin:0}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{min-height:36px;padding:0 14px;border:0;background:var(--bg);color:var(--fg)}
+.seg button[aria-pressed="true"]{background:var(--accent);color:var(--btn-fg);font-weight:600}
 .spot-pin{background:var(--accent);color:var(--btn-fg);width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font:600 12px var(--mono);border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4)}
 </style>
 </head>
@@ -95,7 +104,7 @@ a{color:var(--accent)}
     <div class="top">
       <div>
         <h1>Isolation Finder</h1>
-        <p class="sub lead">Outlines every populated area with a one mile radius, then finds the farms and manor houses outside them and gives each a half mile radius. Green is what is left.</p>
+        <p class="sub lead">Draws a radius around every populated area and every lone farm or house, using the sizes you choose. Green is what is left.</p>
       </div>
       <form id="searchForm" class="row">
         <input id="q" type="search" placeholder="Search a place or postcode" aria-label="Search for a place" enterkeyhint="search">
@@ -103,11 +112,10 @@ a{color:var(--accent)}
         <button class="btn" type="button" id="locate" title="Use my location" aria-label="Use my location">Me</button>
       </form>
       <div class="row">
-        <select id="radius" aria-label="Scan radius">
-          <option value="2">2 mile radius</option>
-          <option value="5" selected>5 mile radius</option>
-          <option value="10">10 mile radius</option>
-        </select>
+        <div class="slider grow">
+          <label class="kv" for="searchR"><span>Search radius</span> <output id="searchROut">5 mi</output></label>
+          <input type="range" id="searchR" min="1" max="20" step="1" value="5">
+        </div>
         <button class="btn primary" id="scan">Scan around map centre</button>
       </div>
       <p id="status" role="status">Starting up…</p>
@@ -116,16 +124,26 @@ a{color:var(--accent)}
     <div class="more">
     <ul class="legend">
       <li><span class="sw" style="background:rgba(47,158,98,.55)"></span>Remote: outside every radius</li>
-      <li><span class="sw" style="background:rgba(196,67,47,.5)"></span>Populated area, plus 1 mile around it</li>
-      <li><span class="sw" style="background:rgba(221,154,31,.55)"></span>Lone house or farm, plus ½ mile around it</li>
+      <li><span class="sw" style="background:rgba(196,67,47,.5)"></span>Populated area, plus its radius</li>
+      <li><span class="sw" style="background:rgba(221,154,31,.55)"></span>Lone house or farm, plus its radius</li>
     </ul>
+
+    <div class="radii">
+      <div class="radhead">
+        <h2>Radius around each kind of place</h2>
+        <div class="seg" role="group" aria-label="Units">
+          <button type="button" id="uMi" aria-pressed="true">Miles</button><button type="button" id="uKm" aria-pressed="false">Km</button>
+        </div>
+      </div>
+      <div class="radii" id="radii"></div>
+      <div class="row"><button class="btn" type="button" id="resetRadii">Reset to ½ mile and 1 mile</button></div>
+    </div>
 
     <div class="opts">
       <label><input type="checkbox" id="showRemote" checked> Show remote areas</label>
       <label><input type="checkbox" id="showRadii" checked> Show radii and populated areas</label>
       <label><input type="checkbox" id="showHomes" checked> Show lone houses</label>
       <label><input type="checkbox" id="incUntagged" checked> Count buildings tagged only as "building"</label>
-      <label><input type="checkbox" id="incHamlets" checked> Treat hamlets as populated areas</label>
       <label>Map style
         <select id="basemap" aria-label="Map style">
           <option value="topo" selected>Terrain</option>
@@ -152,7 +170,7 @@ a{color:var(--accent)}
       <summary>How this works and what it misses</summary>
       <p>Populated areas are the residential zones mapped in OpenStreetMap, plus any village, town or city point, plus any cluster of buildings that looks like an unmapped village. Everything else is a lone house.</p>
       <p>Unmapped homes do not appear, and untagged buildings include barns and sheds, so tick the box above off for a stricter picture. Distances are straight lines. Check the satellite view before you trust any spot, and respect land access.</p>
-      <p>Each scan covers your chosen radius around the map centre, plus a mile and a half margin so the edges stay accurate. Areas you scan are saved on this device for 30 days, so scanning the same or a nearby area again only downloads what is missing.</p>
+      <p>Set a radius to zero to ignore that kind of place. Each scan covers your search radius around the map centre, plus a margin as wide as your largest radius so the edges stay accurate. Areas you scan are saved on this device for 30 days, so scanning the same or a nearby area again only downloads what is missing.</p>
     </details>
     </div>
   </aside>
@@ -170,10 +188,12 @@ function makeProj(lat0, lon0){
   };
 }
 
+/* Grid cell key as one number (cells stay well inside ±32768 for any scan). */
+const gkey=(gx,gy)=>(gx+32768)*65536+(gy+32768);
 function buildIndex(xs, ys, cell){
   const m = new Map();
   for(let i=0;i<xs.length;i++){
-    const k = Math.floor(xs[i]/cell)+','+Math.floor(ys[i]/cell);
+    const k = gkey(Math.floor(xs[i]/cell), Math.floor(ys[i]/cell));
     const a = m.get(k);
     if(a) a.push(i); else m.set(k,[i]);
   }
@@ -189,7 +209,7 @@ function classify(xs, ys, place, minNeighbours, R){
     const cx=Math.floor(xs[i]/R), cy=Math.floor(ys[i]/R);
     let n=0;
     outer: for(let dx=-1;dx<=1;dx++) for(let dy=-1;dy<=1;dy++){
-      const a = idx.m.get((cx+dx)+','+(cy+dy));
+      const a = idx.m.get(gkey(cx+dx,cy+dy));
       if(!a) continue;
       for(const j of a){
         if(j===i || place[j]) continue;
@@ -233,29 +253,28 @@ function densify(polys, step){
   return {xs, ys};
 }
 
-/* Nearest populated-area point and nearest lone home, never looking further than limit. */
-function nearestBoth(idx, xs, ys, cluster, x, y, limit){
+/* Nearest point in one index, never looking further than limit. */
+function nearestIn(idx, xs, ys, x, y, limit){
   const {m, cell} = idx;
-  let bS=Infinity, bC=Infinity;
+  let best = Infinity;
   const cx=Math.floor(x/cell), cy=Math.floor(y/cell), maxR=Math.ceil(limit/cell)+1;
   for(let r=0;r<=maxR;r++){
-    if(r>1 && Math.min(bS,limit)<=(r-1)*cell && Math.min(bC,limit)<=(r-1)*cell) break;
+    if(r>1 && Math.min(best,limit)<=(r-1)*cell) break;
     for(let dx=-r;dx<=r;dx++){
       const edge = Math.abs(dx)===r;
       for(let dy=-r;dy<=r;dy+=(edge||r===0)?1:2*r){
-        const a = m.get((cx+dx)+','+(cy+dy));
+        const a = m.get(gkey(cx+dx,cy+dy));
         if(!a) continue;
         for(const j of a){
-          const ddx=xs[j]-x, ddy=ys[j]-y, d=Math.sqrt(ddx*ddx+ddy*ddy);
-          if(cluster[j]){ if(d<bC) bC=d; } else if(d<bS) bS=d;
+          const ddx=xs[j]-x, ddy=ys[j]-y, d=ddx*ddx+ddy*ddy;
+          if(d<best*best) best=Math.sqrt(d);
         }
       }
     }
   }
-  return {dS:Math.min(bS,limit), dC:Math.min(bC,limit), capS:bS>=limit, capC:bC>=limit};
+  return best;
 }
 
-/* Grid-search the circle for points furthest outside both radii. */
 /* Grid index over polygon bounding boxes, so testing thousands of points stays fast. */
 function makePolyTest(polys, cell){
   const m=new Map();
@@ -279,24 +298,42 @@ function makePolyTest(polys, cell){
   };
 }
 
-function findSpots(xs, ys, cluster, inner, fetched, count, inside){
-  const CELL = 2*MI, idx = buildIndex(xs, ys, CELL);
-  const w = inner.maxX-inner.minX, h = inner.maxY-inner.minY;
-  const step = Math.max(150, Math.sqrt(w*h/20000));
-  const cands = [];
+/* Grid-search the circle for the points furthest outside every radius.
+   score = the smallest (distance / radius) over the kinds of place, so 1 or more means outside them all. */
+function findSpots(xs, ys, cls, radii, inner, fetched, count, inside){
+  /* one index per kind, so a kind with no examples nearby costs nothing to search */
+  const per=radii.map((r,k)=>{
+    if(!(r>0)) return null;
+    const sx=[], sy=[];
+    for(let i=0;i<xs.length;i++) if(cls[i]===k){ sx.push(xs[i]); sy.push(ys[i]); }
+    if(!sx.length) return {empty:true};
+    const X=Float64Array.from(sx), Y=Float64Array.from(sy);
+    return {X, Y, idx:buildIndex(X, Y, Math.max(400, Math.min(2*MI, r)))};
+  });
+  const w=inner.maxX-inner.minX, h=inner.maxY-inner.minY;
+  const step=Math.max(150, Math.sqrt(w*h/20000));
+  const cands=[];
   for(let x=inner.minX+step/2; x<inner.maxX; x+=step){
     for(let y=inner.minY+step/2; y<inner.maxY; y+=step){
       if(inner.circle && Math.hypot(x-inner.circle.x, y-inner.circle.y)>inner.circle.r) continue;
       if(inside && inside(x,y)) continue;
-      const limit = Math.min(x-fetched.minX, fetched.maxX-x, y-fetched.minY, fetched.maxY-y);
-      if(limit<=0) continue;
-      const r = nearestBoth(idx, xs, ys, cluster, x, y, limit);
-      cands.push({x, y, dS:r.dS, dC:r.dC, capS:r.capS, capC:r.capC,
-                  score:Math.min(r.dS/(0.5*MI), r.dC/MI)});
+      let edgeD=Math.min(x-fetched.minX, fetched.maxX-x, y-fetched.minY, fetched.maxY-y);
+      if(fetched.circle) edgeD=Math.min(edgeD, fetched.circle.r-Math.hypot(x-fetched.circle.x, y-fetched.circle.y));
+      if(edgeD<=0) continue;
+      let score=Infinity, dS=Infinity, capS=false, dC=Infinity, capC=false;
+      for(let k=0;k<radii.length;k++){
+        const P=per[k]; if(!P) continue;
+        const limit=Math.min(edgeD, 4*radii[k]);
+        const b=P.empty?Infinity:nearestIn(P.idx, P.X, P.Y, x, y, limit);
+        const d=Math.min(b,limit), cap=b>=limit;
+        score=Math.min(score, d/radii[k]);
+        if(k===0){ dS=d; capS=cap; } else if(d<dC){ dC=d; capC=cap; }
+      }
+      cands.push({x, y, dS, dC, capS, capC, score});
     }
   }
   cands.sort((a,b)=>b.score-a.score);
-  const picked = [];
+  const picked=[];
   for(const c of cands){
     if(picked.length>=count) break;
     if(picked.every(p=>Math.hypot(p.x-c.x,p.y-c.y)>=2000)) picked.push(c);
@@ -310,7 +347,31 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
 (function(){
   const $ = id => document.getElementById(id);
   const MIRRORS=['https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
-  const state={homes:[],active:[],cluster:null,polys:[],inside:null,proj:null,circle:null,innerXY:null,fetchXY:null,scanned:false,busy:false};
+  const state={homes:[],active:[],cls:null,search:null,polys:[],inside:null,proj:null,circle:null,innerXY:null,fetchXY:null,margin:0,scanned:false,busy:false};
+
+  /* Radius settings, kept in metres and remembered on this device. */
+  const KINDS=[
+    {k:'lone',label:'Lone houses and farms'},
+    {k:'built',label:'Built-up areas and building clusters'},
+    {k:'hamlet',label:'Hamlets'},
+    {k:'village',label:'Villages'},
+    {k:'town',label:'Towns'},
+    {k:'city',label:'Cities'}];
+  const DEF={units:'mi',search:5*MI,lone:0.5*MI,built:MI,hamlet:MI,village:MI,town:MI,city:MI};
+  const cfg=Object.assign({},DEF);
+  try{ const s=JSON.parse(localStorage.getItem('if-settings')||'null'); if(s) for(const k in DEF) if(typeof s[k]===typeof DEF[k]) cfg[k]=s[k]; }catch(e){}
+  const saveCfg=()=>{ try{ localStorage.setItem('if-settings',JSON.stringify(cfg)); }catch(e){} };
+  const unitM=()=>cfg.units==='km'?1000:MI;
+  const trim=s=>s.indexOf('.')<0?s:s.replace(/0+$/,'').replace(/\.$/,'');
+  function fmtIn(m,units,cap){
+    if(!isFinite(m)) return '–';
+    const plus=cap?'+':'';
+    if(units==='km') return m<1000 ? Math.round(m/10)*10+plus+' m' : trim((m/1000).toFixed(1))+plus+' km';
+    const mi=m/MI;
+    return trim(mi<1?mi.toFixed(2):mi.toFixed(1))+plus+' mi';
+  }
+  const fmtDist=(m,cap)=>fmtIn(m,cfg.units,cap);
+  const radiiNow=()=>KINDS.map(kd=>cfg[kd.k]);
   const small=window.matchMedia('(max-width:900px)');
 
   const map=L.map('map',{zoomControl:true}).setView([54.3,-2.6],6);
@@ -354,14 +415,14 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
       c.width=size.x*dpr; c.height=size.y*dpr; c.style.width=size.x+'px'; c.style.height=size.y+'px';
       L.DomUtil.setPosition(c,m.containerPointToLayerPoint([0,0]));
       const ctx=c.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
-      if(!state.scanned||!state.cluster) return;
+      if(!state.scanned||!state.cls) return;
       const mpp=156543.03392*Math.cos(m.getCenter().lat*Math.PI/180)/Math.pow(2,m.getZoom());
-      const rM=MI/mpp, rH=0.5*MI/mpp, pad=rM+4;
-      const A=[],B=[];
+      const rpx=radiiNow().map(r=>r/mpp), pad=Math.max(...rpx)+4;
+      const G=KINDS.map(()=>[]);
       for(let i=0;i<state.active.length;i++){
         const h=state.active[i], p=m.latLngToContainerPoint([h.lat,h.lon]);
         if(p.x<-pad||p.x>size.x+pad||p.y<-pad||p.y>size.y+pad) continue;
-        (state.cluster[i]?A:B).push(p.x,p.y);
+        G[state.cls[i]].push(p.x,p.y);
       }
       const vb=m.getBounds().pad(1.2), vs=vb.getSouth(), vn=vb.getNorth(), vw=vb.getWest(), ve=vb.getEast();
       const polyPath=g=>{
@@ -382,14 +443,16 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
       };
       const mk=()=>{const k=document.createElement('canvas');k.width=c.width;k.height=c.height;const g=k.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);return [k,g];};
 
-      /* mile mask: mapped areas stroked wide with round joins (an exact one mile buffer) plus place and cluster points */
+      /* populated mask: mapped areas stroked wide with round joins (an exact buffer), plus clusters and settlement points */
       const [Mk,Mg]=mk();
-      Mg.fillStyle=Mg.strokeStyle='rgb(196,67,47)'; Mg.lineJoin=Mg.lineCap='round'; Mg.lineWidth=2*rM;
-      polyPath(Mg); Mg.fill(); Mg.stroke();
-      circles(Mg,A,rM); Mg.fill();
-      /* half mile mask: lone houses */
+      Mg.fillStyle=Mg.strokeStyle='rgb(196,67,47)'; Mg.lineJoin=Mg.lineCap='round';
+      polyPath(Mg); Mg.fill();
+      if(rpx[1]>0){ Mg.lineWidth=2*rpx[1]; Mg.stroke(); }
+      for(let k=1;k<KINDS.length;k++) if(rpx[k]>0){ circles(Mg,G[k],rpx[k]); Mg.fill(); }
+      /* lone house mask */
       const [Hk,Hg]=mk();
-      Hg.fillStyle='rgb(221,154,31)'; circles(Hg,B,rH); Hg.fill();
+      Hg.fillStyle='rgb(221,154,31)';
+      if(rpx[0]>0){ circles(Hg,G[0],rpx[0]); Hg.fill(); }
 
       if($('showRadii').checked){
         ctx.globalAlpha=0.30; ctx.drawImage(Mk,0,0,size.x,size.y);
@@ -411,8 +474,8 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
       if($('showHomes').checked && m.getZoom()>=12){
         ctx.lineWidth=1; ctx.strokeStyle='rgba(255,255,255,0.85)';
         const dots=(arr,r,col)=>{ctx.fillStyle=col;for(let i=0;i<arr.length;i+=2){ctx.beginPath();ctx.arc(arr[i],arr[i+1],r,0,Math.PI*2);ctx.fill();ctx.stroke();}};
-        if(m.getZoom()>=14) dots(A,2,'#2b2b2b');
-        dots(B,3.5,'#b3261e');
+        if(m.getZoom()>=14) dots(G[1],2,'#2b2b2b');
+        dots(G[0],3.5,'#b3261e');
       }
     }
   });
@@ -428,41 +491,53 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
     }
   }
 
+  /* Sort every point into a kind, then build the arrays the spot search uses. */
   function reclassify(){
     if(!state.scanned) return;
-    const incU=$('incUntagged').checked, incH=$('incHamlets').checked;
-    state.active=state.homes.filter(h=>!(h.untagged&&!incU)&&!(h.ptype==='hamlet'&&!incH));
+    const incU=$('incUntagged').checked;
+    state.active=state.homes.filter(h=>!(h.untagged&&!incU));
     const n=state.active.length;
     const xs=Float64Array.from(state.active,h=>h.x), ys=Float64Array.from(state.active,h=>h.y);
-    const place=state.active.map(h=>h.place);
-    state.cluster=classify(xs,ys,place,+$('minN').value,200);
-    refreshPlaces(); cover.redraw();
+    const cl=classify(xs,ys,state.active.map(h=>h.place),+$('minN').value,200);
+    const PC={hamlet:2,village:3,town:4,city:5};
+    state.cls=new Uint8Array(n);
+    for(let i=0;i<n;i++){ const h=state.active[i]; state.cls[i]=h.place?(PC[h.ptype]||3):(cl[i]?1:0); }
     /* spot search sees homes plus sample points along every mapped populated-area edge */
     const ext=densify(state.polys,150), total=n+ext.xs.length;
     const X=new Float64Array(total), Y=new Float64Array(total), C=new Uint8Array(total);
-    X.set(xs); Y.set(ys); C.set(state.cluster);
+    X.set(xs); Y.set(ys); C.set(state.cls);
     X.set(ext.xs,n); Y.set(ext.ys,n); C.fill(1,n);
-    const spots=findSpots(X,Y,C,state.innerXY,state.fetchXY,8,state.inside);
-    const good=renderSpots(spots);
-    const lone=state.cluster.reduce((a,v)=>a+(v?0:1),0);
-    setStatus(good?good+' remote spot'+(good===1?'':'s')+' found. '+state.polys.length+' populated area'+(state.polys.length===1?'':'s')+' outlined, '+lone.toLocaleString()+' lone house'+(lone===1?'':'s')+' outside them.'
-                  :'No remote spot in this circle. Try a different place or a larger radius.');
+    state.search={X,Y,C};
+    refreshPlaces();
+    recompute();
   }
 
-  const fmt=(d,cap)=>(d/MI).toFixed(1)+(cap?'+':'')+' mi';
+  /* Redraw and re-rank spots for the current radii, without downloading anything. */
+  function recompute(){
+    if(!state.scanned||!state.search) return;
+    cover.redraw();
+    const radii=radiiNow(), {X,Y,C}=state.search;
+    const good=renderSpots(findSpots(X,Y,C,radii,state.innerXY,state.fetchXY,8,state.inside));
+    let lone=0; for(const v of state.cls) if(v===0) lone++;
+    let msg=good?good+' remote spot'+(good===1?'':'s')+' found. '+state.polys.length+' populated area'+(state.polys.length===1?'':'s')+' outlined, '+lone.toLocaleString()+' lone house'+(lone===1?'':'s')+' outside them.'
+                :'No remote spot in this circle. Try a different place, a larger search radius or smaller radii.';
+    if(Math.max(...radii)>state.margin+50) msg+=' Some radii are now wider than the area downloaded, so tap Scan again to include places further out.';
+    setStatus(msg);
+  }
+
   function renderSpots(spots){
     spotLayer.clearLayers();
     const ol=$('spots'); ol.innerHTML='';
     const good=spots.filter(s=>s.score>=1);
     if(!good.length){
-      ol.innerHTML='<li class="sub">Every point in this circle is inside a radius. Search emptier country or use a larger radius.</li>';
+      ol.innerHTML='<li class="sub">Every point in this circle is inside a radius. Search emptier country, widen the search or shrink the radii.</li>';
       return 0;
     }
     good.forEach((s,i)=>{
       const [lat,lon]=state.proj.inv(s.x,s.y);
       L.marker([lat,lon],{icon:L.divIcon({className:'',html:'<div class="spot-pin">'+(i+1)+'</div>',iconSize:[24,24],iconAnchor:[12,12]})}).addTo(spotLayer);
       const li=document.createElement('li'), b=document.createElement('button');
-      b.innerHTML='<span class="rank">'+(i+1)+'</span><span class="txt"><b>'+lat.toFixed(4)+', '+lon.toFixed(4)+'</b><small>'+fmt(s.dC,s.capC)+' from nearest populated area · '+fmt(s.dS,s.capS)+' from nearest lone house</small></span>';
+      b.innerHTML='<span class="rank">'+(i+1)+'</span><span class="txt"><b>'+lat.toFixed(4)+', '+lon.toFixed(4)+'</b><small>'+fmtDist(s.dC,s.capC)+' from nearest populated area · '+fmtDist(s.dS,s.capS)+' from nearest lone house</small></span>';
       b.onclick=()=>{ if(small.matches) setCollapsed(true); map.flyTo([lat,lon],Math.max(map.getZoom(),14)); };
       li.appendChild(b); ol.appendChild(li);
     });
@@ -566,10 +641,16 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
 
   /* Load every tile the scan needs: saved ones straight from the browser, missing ones from the server
      in blocks of up to 2 by 2 tiles, one request at a time. */
-  async function loadAll(f){
+  async function loadAll(f,circ){
     const i0=Math.floor(f.s/TLAT), i1=Math.floor(f.n/TLAT), j0=Math.floor(f.w/TLON), j1=Math.floor(f.e/TLON);
+    const kxc=111320*Math.cos(circ.lat*Math.PI/180);
+    const touches=(i,j)=>{ /* does tile (i,j) come within circ.r of the centre? */
+      const la=Math.min(Math.max(circ.lat,i*TLAT),(i+1)*TLAT), lo=Math.min(Math.max(circ.lon,j*TLON),(j+1)*TLON);
+      return Math.hypot((la-circ.lat)*110574,(lo-circ.lon)*kxc)<=circ.r;
+    };
     const tiles=new Map(), missing=[];
     for(let i=i0;i<=i1;i++) for(let j=j0;j<=j1;j++){
+      if(!touches(i,j)) continue;
       const key=i+'_'+j, v=await getTile(key);
       if(v) tiles.set(key,v); else missing.push([i,j]);
     }
@@ -622,18 +703,18 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
   async function scan(lat,lon){
     if(state.busy) return;
     if(lat===undefined){const mc=map.getCenter(); lat=mc.lat; lon=mc.lng;}
-    const miles=+$('radius').value, R=miles*MI;
+    const R=cfg.search, margin=Math.max(1.5*MI,...radiiNow());
     state.busy=true; $('scan').disabled=true;
-    setStatus(miles>=10?'Scanning a '+miles+' mile radius. This can take a minute.':'Scanning a '+miles+' mile radius…');
+    setStatus('Scanning a '+fmtDist(R)+' radius'+(R>=10*MI?'. A large new area can take a few minutes the first time.':'…'));
     try{
       const proj=makeProj(lat,lon);
       const box=L.latLng(lat,lon).toBounds(2*R);
       map.fitBounds(box,{padding:[8,8],animate:false});
       ringLayer.clearLayers();
       L.circle([lat,lon],{radius:R,color:'#2f9e62',weight:2,fill:false,dashArray:'6 6',interactive:false}).addTo(ringLayer);
-      const mLat=1.5*MI/110574, mLon=1.5*MI/(111320*Math.cos(lat*Math.PI/180));
+      const mLat=margin/110574, mLon=margin/(111320*Math.cos(lat*Math.PI/180));
       const f={s:box.getSouth()-mLat,w:box.getWest()-mLon,n:box.getNorth()+mLat,e:box.getEast()+mLon};
-      const data=await loadAll(f);
+      const data=await loadAll(f,{lat,lon,r:R+margin});
 
       /* mapped populated areas */
       const polys=[];
@@ -664,7 +745,8 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
       state.circle={lat,lon,r:R};
       state.innerXY={minX:-R,minY:-R,maxX:R,maxY:R,circle:{x:0,y:0,r:R}};
       const cb=data.bounds, f1=proj.fwd(cb.s,cb.w), f2=proj.fwd(cb.n,cb.e);
-      state.fetchXY={minX:f1[0],minY:f1[1],maxX:f2[0],maxY:f2[1]};
+      state.fetchXY={minX:f1[0],minY:f1[1],maxX:f2[0],maxY:f2[1],circle:{x:0,y:0,r:R+margin}};
+      state.margin=margin;
       reclassify();
       if(!data.downloaded) setStatus($('status').textContent+' Loaded from data saved on this device.');
     }catch(e){
@@ -682,7 +764,38 @@ function findSpots(xs, ys, cluster, inner, fetched, count, inside){
 
   $('clearCache').onclick=async()=>{ await clearTiles(); setStatus('Saved map data cleared. The next scan downloads fresh data.'); };
   ['showRemote','showRadii','showHomes'].forEach(id=>$(id).onchange=()=>cover.redraw());
-  ['incUntagged','incHamlets'].forEach(id=>$(id).onchange=reclassify);
+  $('incUntagged').onchange=reclassify;
+
+  /* Radius sliders */
+  function showVals(){
+    const other=cfg.units==='km'?'mi':'km';
+    for(const kd of KINDS) $('o_'+kd.k).textContent=cfg[kd.k]>0?fmtDist(cfg[kd.k])+' · '+fmtIn(cfg[kd.k],other):'Ignored';
+    $('searchROut').textContent=fmtDist(cfg.search);
+  }
+  function applyUnits(){
+    const u=unitM(), km=cfg.units==='km';
+    for(const kd of KINDS){ const inp=$('r_'+kd.k); inp.min=0; inp.max=km?8:5; inp.step=0.05; inp.value=cfg[kd.k]/u; }
+    const s=$('searchR'); s.min=km?2:1; s.max=km?32:20; s.step=1; s.value=Math.round(cfg.search/u);
+    $('uMi').setAttribute('aria-pressed',String(!km)); $('uKm').setAttribute('aria-pressed',String(km));
+    showVals();
+  }
+  for(const kd of KINDS){
+    const wrap=document.createElement('div'); wrap.className='slider';
+    const lab=document.createElement('label'); lab.className='kv'; lab.htmlFor='r_'+kd.k;
+    const sp=document.createElement('span'); sp.textContent=kd.label;
+    const out=document.createElement('output'); out.id='o_'+kd.k;
+    lab.append(sp,' ',out);
+    const inp=document.createElement('input'); inp.type='range'; inp.id='r_'+kd.k;
+    inp.oninput=()=>{ cfg[kd.k]=+inp.value*unitM(); showVals(); cover.redraw(); };
+    inp.onchange=()=>{ saveCfg(); recompute(); };
+    wrap.append(lab,inp); $('radii').appendChild(wrap);
+  }
+  $('searchR').oninput=()=>{ cfg.search=+$('searchR').value*unitM(); showVals(); };
+  $('searchR').onchange=saveCfg;
+  $('uMi').onclick=()=>{ cfg.units='mi'; saveCfg(); applyUnits(); recompute(); };
+  $('uKm').onclick=()=>{ cfg.units='km'; saveCfg(); applyUnits(); recompute(); };
+  $('resetRadii').onclick=()=>{ for(const kd of KINDS) cfg[kd.k]=DEF[kd.k]; saveCfg(); applyUnits(); recompute(); };
+  applyUnits();
   $('minN').oninput=()=>{$('minNOut').textContent=$('minN').value;};
   $('minN').onchange=reclassify;
   $('basemap').onchange=()=>{ map.removeLayer(base); base=bases[$('basemap').value].addTo(map); };
